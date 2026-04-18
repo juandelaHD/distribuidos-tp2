@@ -79,3 +79,28 @@ Al momento de la evaluación y ejecución de las pruebas se **descartarán** o *
 - La implementación del protocolo de comunicación externo y `FruitItem`.
 
 Redactar un breve informe explicando el modo en que se coordinan las instancias de Sum y Aggregation, así como el modo en el que el sistema escala respecto a los clientes y a la cantidad de controles.
+
+## Resolución (Golang)
+
+### Supuestos generales
+
+Los siguientes supuestos aplican a toda la resolución, independientemente del escenario, y conviene tenerlos a la vista antes de entrar a los detalles de cada etapa.
+
+Se asume que ningún nodo se cae durante una corrida y que el broker no pierde mensajes. El sistema no implementa tolerancia a fallos, no hay reintentos a nivel aplicación, reconciliación de estado, ni recuperación ante caídas.
+
+El `client_id` que circula por el protocolo interno es un entero efímero que el gateway asigna en orden de aceptación de conexiones TCP. Vive únicamente durante la corrida y no se persiste ni se expone a los clientes: existe solo para separar los flujos dentro del sistema.
+
+Las colas de RabbitMQ se levantan vacías en cada `make up` porque no hay volúmenes persistentes configurados. No quedan mensajes residuales entre corridas, por lo que cada ejecución parte de un estado limpio.
+
+### Parte 1 — Multi-cliente con una sola réplica de cada control (escenario 2)
+
+En esta etapa tenemos tres clientes concurrentes que consultan al sistema contra una única instancia de Sum, Aggregator y Joiner. El objetivo concreto es que cada cliente reciba su propio top de frutas sin que los datos de un cliente contaminen el resultado de otro, manteniendo intactos todos los componentes que el enunciado declara inmodificables.
+
+El cambio central está en el protocolo de mensajería interno. Antes, los nodos intercambiaban listas de pares `(fruta, cantidad)` y la marca de fin de stream se codificaba como una lista vacía. Esa representación funcionaba para un único cliente porque el sistema entero podía suponer que todos los datos pertenecían a la misma consulta. Cuando aparecen varios clientes en paralelo, esa suposición deja de ser válida y hace falta que cada mensaje viaje con un dato extra sobre el cliente que lo originó. Por eso el formato lo pasé a `{"c": <client_id>, "d": [{"f": <fruta>, "a": <cantidad>}]}`, donde el `client_id` siempre acompaña al mensaje, sea de datos o de fin. La marca de EOF se sigue representando con `d` vacío. En esta etapa cada mensaje publicado contiene exactamente una fila, porque el protocolo externo entre el cliente y el gateway vi que envía un record esperando su ACK y el gateway propaga cada fila al broker uno a uno. Creo que sería ventajoso batchear esos mensajes para reducir el overhead de serialización y publicación pero la lógica de "leer-serializar-publicar" está fuera del `message_handler` así que esa optimización queda fuera del alcance de esta etapa.
+
+Cabe mencionar que el gateway es el responsable de asignar y sostener las identidades. Cada vez que acepta una conexión TCP construye un `MessageHandler` y le asigna un identificador entero único, tomado de un contador que vive en el paquete del handler. Ese identificador viaja sellado en cada mensaje que el handler serializa al ingresar a `input_queue`. Para el camino de respuesta, el handler hace el filtro inverso asi que cuando el gateway le ofrece un mensaje proveniente de `results_queue`, el handler deserializa, compara el `client_id` con el suyo y devuelve `nil` si no le pertenece.
+
+Sum y Aggregator dejan de tener un único diccionario global de acumulación. En su lugar, cada uno mantiene una estructura `map[ClientID -> map[string -> FruitItem]]`, que aísla los datos de cada cliente. Cuando llega un mensaje de datos para un cliente nuevo, el diccionario correspondiente se crea y si llega el EOF de un cliente, el nodo envía los datos acumulados al siguiente paso, reenvía el EOF con el mismo client_id y borra la entrada del diccionario para liberar memoria. Cada cliente tiene su propia entrada en el diccionario, por lo que los datos  de distintas consultas nunca se mezclan. Esto funciona porque el middleware procesa los mensajes de a uno por vez, sin paralelismo dentro del nodo, así que no hace falta ningún mecanismo de sincronización.
+
+El Joiner solo termina enviando los tops parciales preservando el `client_id` y descarta las marcas de EOF, que no aportan información útil (al menos para este escenario) al gateway donde aún no hay coordinación de varios Aggregators por cliente. Cuando se introduzcan múltiples instancias de Aggregator, creo que sería útil que pasará a contar EOFs por cliente, de modo que el Joiner sepa cuándo recibió todos los tops parciales de un cliente y pueda enviar el resultado final al gateway, pero por ahora esa información no es necesaria.
+

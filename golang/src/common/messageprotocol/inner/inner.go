@@ -2,69 +2,56 @@ package inner
 
 import (
 	"encoding/json"
-	"errors"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/middleware"
 )
 
-func serializeJson(message []interface{}) ([]byte, error) {
-	return json.Marshal(message)
+type ClientID uint32
+
+type wireFruitItem struct {
+	Fruit  string `json:"f"`
+	Amount uint32 `json:"a"`
 }
 
-func deserializeJson(message []byte) ([]interface{}, error) {
-	var data []interface{}
-	if err := json.Unmarshal(message, &data); err != nil {
-		return nil, err
-	}
-	return data, nil
+type wireMessage struct {
+	ClientID ClientID        `json:"c"`
+	Data     []wireFruitItem `json:"d"`
 }
 
-func SerializeMessage(fruitRecords []fruititem.FruitItem) (*middleware.Message, error) {
-	data := []interface{}{}
+func SerializeMessage(clientID ClientID, fruitRecords []fruititem.FruitItem) (*middleware.Message, error) {
+	wireRecords := make([]wireFruitItem, 0, len(fruitRecords))
 	for _, fruitRecord := range fruitRecords {
-		datum := []interface{}{
-			fruitRecord.Fruit,
-			fruitRecord.Amount,
-		}
-		data = append(data, datum)
+		wireRecords = append(wireRecords, wireFruitItem{
+			Fruit:  fruitRecord.Fruit,
+			Amount: fruitRecord.Amount,
+		})
 	}
 
-	body, err := serializeJson(data)
+	body, err := json.Marshal(wireMessage{ClientID: clientID, Data: wireRecords})
 	if err != nil {
 		return nil, err
 	}
-	message := middleware.Message{Body: string(body)}
-
-	return &message, nil
+	return &middleware.Message{Body: string(body)}, nil
 }
 
-func DeserializeMessage(message *middleware.Message) ([]fruititem.FruitItem, bool, error) {
-	data, err := deserializeJson([]byte((*message).Body))
-	if err != nil {
-		return nil, false, err
+func SerializeEOFMessage(clientID ClientID) (*middleware.Message, error) {
+	return SerializeMessage(clientID, nil)
+}
+
+func DeserializeMessage(message *middleware.Message) (ClientID, []fruititem.FruitItem, bool, error) {
+	var wire wireMessage
+	if err := json.Unmarshal([]byte(message.Body), &wire); err != nil {
+		return 0, nil, false, err
 	}
 
-	fruitRecords := []fruititem.FruitItem{}
-	for _, datum := range data {
-		fruitPair, ok := datum.([]interface{})
-		if !ok {
-			return nil, false, errors.New("Datum is not an array")
-		}
-
-		fruit, ok := fruitPair[0].(string)
-		if !ok {
-			return nil, false, errors.New("Datum is not a (fruit, amount) pair")
-		}
-
-		fruitAmount, ok := fruitPair[1].(float64)
-		if !ok {
-			return nil, false, errors.New("Datum is not a (fruit, amount) pair")
-		}
-
-		fruitRecord := fruititem.FruitItem{Fruit: fruit, Amount: uint32(fruitAmount)}
-		fruitRecords = append(fruitRecords, fruitRecord)
+	fruitRecords := make([]fruititem.FruitItem, 0, len(wire.Data))
+	for _, wireRecord := range wire.Data {
+		fruitRecords = append(fruitRecords, fruititem.FruitItem{
+			Fruit:  wireRecord.Fruit,
+			Amount: wireRecord.Amount,
+		})
 	}
 
-	return fruitRecords, len(fruitRecords) == 0, nil
+	return wire.ClientID, fruitRecords, len(fruitRecords) == 0, nil
 }
