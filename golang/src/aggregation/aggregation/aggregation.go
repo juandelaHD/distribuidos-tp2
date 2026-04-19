@@ -3,12 +3,19 @@ package aggregation
 import (
 	"fmt"
 	"log/slog"
+	"os"
+	"os/signal"
 	"sort"
+	"sync"
+	"sync/atomic"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/middleware"
 )
+
+const consumerCount = 1
 
 type AggregationConfig struct {
 	Id                int
@@ -29,6 +36,11 @@ type Aggregation struct {
 	topSize       int
 	sumAmount     int
 	eofCounts     map[inner.ClientID]int
+
+	running      atomic.Bool
+	consumers    sync.WaitGroup
+	shutdownOnce sync.Once
+	done         chan struct{}
 }
 
 func NewAggregation(config AggregationConfig) (*Aggregation, error) {
@@ -46,20 +58,70 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 		return nil, err
 	}
 
-	return &Aggregation{
+	aggregation := &Aggregation{
 		outputQueue:   outputQueue,
 		inputQueue:    inputQueue,
 		fruitItemMaps: map[inner.ClientID]map[string]fruititem.FruitItem{},
 		topSize:       config.TopSize,
 		sumAmount:     config.SumAmount,
 		eofCounts:     map[inner.ClientID]int{},
-	}, nil
+		done:          make(chan struct{}),
+	}
+	aggregation.running.Store(true)
+	return aggregation, nil
 }
 
-func (aggregation *Aggregation) Run() {
-	aggregation.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-		aggregation.handleMessage(msg, ack, nack)
+func (aggregation *Aggregation) Run() error {
+	go aggregation.handleSignals()
+
+	aggregation.consumers.Add(consumerCount)
+	go func() {
+		defer aggregation.consumers.Done()
+		err := aggregation.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+			aggregation.handleMessage(msg, ack, nack)
+		})
+		if err != nil && aggregation.running.Load() {
+			slog.Error("Input consumer stopped unexpectedly", "err", err)
+			aggregation.shutdown()
+		}
+	}()
+
+	aggregation.consumers.Wait()
+	return aggregation.closeAll()
+}
+
+func (aggregation *Aggregation) handleSignals() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	select {
+	case <-signals:
+		aggregation.shutdown()
+	case <-aggregation.done:
+		// Acá se manejaría el caso de una falla inesperada de consumer que dispare el shutdown desde otro lado que no sea la señal.
+		// El TP asume que ningún nodo se cae, así que en el camino normal el shutdown siempre lo dispara SIGTERM.
+	}
+}
+
+func (aggregation *Aggregation) shutdown() {
+	aggregation.shutdownOnce.Do(func() {
+		slog.Info("SIGTERM received, shutting down")
+		aggregation.running.Store(false)
+		if err := aggregation.inputQueue.StopConsuming(); err != nil {
+			slog.Debug("While stopping input consumer", "err", err)
+		}
+		close(aggregation.done)
 	})
+}
+
+func (aggregation *Aggregation) closeAll() error {
+	if err := aggregation.inputQueue.Close(); err != nil {
+		slog.Debug("While closing input queue", "err", err)
+	}
+	if err := aggregation.outputQueue.Close(); err != nil {
+		slog.Debug("While closing output queue", "err", err)
+	}
+	return nil
 }
 
 func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func(), nack func()) {

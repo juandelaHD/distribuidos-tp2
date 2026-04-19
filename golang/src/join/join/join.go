@@ -2,12 +2,19 @@ package join
 
 import (
 	"log/slog"
+	"os"
+	"os/signal"
 	"sort"
+	"sync"
+	"sync/atomic"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/middleware"
 )
+
+const consumerCount = 1
 
 type JoinConfig struct {
 	MomHost           string
@@ -26,8 +33,13 @@ type Join struct {
 	outputQueue       middleware.Middleware
 	aggregationAmount int
 	topSize           int
-	partials  map[inner.ClientID][]fruititem.FruitItem
-	eofCounts map[inner.ClientID]int
+	partials          map[inner.ClientID][]fruititem.FruitItem
+	eofCounts         map[inner.ClientID]int
+
+	running      atomic.Bool
+	consumers    sync.WaitGroup
+	shutdownOnce sync.Once
+	done         chan struct{}
 }
 
 func NewJoin(config JoinConfig) (*Join, error) {
@@ -44,20 +56,70 @@ func NewJoin(config JoinConfig) (*Join, error) {
 		return nil, err
 	}
 
-	return &Join{
+	join := &Join{
 		inputQueue:        inputQueue,
 		outputQueue:       outputQueue,
 		aggregationAmount: config.AggregationAmount,
 		topSize:           config.TopSize,
 		partials:          map[inner.ClientID][]fruititem.FruitItem{},
 		eofCounts:         map[inner.ClientID]int{},
-	}, nil
+		done:              make(chan struct{}),
+	}
+	join.running.Store(true)
+	return join, nil
 }
 
-func (join *Join) Run() {
-	join.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-		join.handleMessage(msg, ack, nack)
+func (join *Join) Run() error {
+	go join.handleSignals()
+
+	join.consumers.Add(consumerCount)
+	go func() {
+		defer join.consumers.Done()
+		err := join.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+			join.handleMessage(msg, ack, nack)
+		})
+		if err != nil && join.running.Load() {
+			slog.Error("Input consumer stopped unexpectedly", "err", err)
+			join.shutdown()
+		}
+	}()
+
+	join.consumers.Wait()
+	return join.closeAll()
+}
+
+func (join *Join) handleSignals() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	select {
+	case <-signals:
+		join.shutdown()
+	case <-join.done:
+		// Acá se manejaría el caso de una falla inesperada de consumer que dispare el shutdown desde otro lado que no sea la señal.
+		// El TP asume que ningún nodo se cae, así que en el camino normal el shutdown siempre lo dispara SIGTERM.
+	}
+}
+
+func (join *Join) shutdown() {
+	join.shutdownOnce.Do(func() {
+		slog.Info("SIGTERM received, shutting down")
+		join.running.Store(false)
+		if err := join.inputQueue.StopConsuming(); err != nil {
+			slog.Debug("While stopping input consumer", "err", err)
+		}
+		close(join.done)
 	})
+}
+
+func (join *Join) closeAll() error {
+	if err := join.inputQueue.Close(); err != nil {
+		slog.Debug("While closing input queue", "err", err)
+	}
+	if err := join.outputQueue.Close(); err != nil {
+		slog.Debug("While closing output queue", "err", err)
+	}
+	return nil
 }
 
 func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) {

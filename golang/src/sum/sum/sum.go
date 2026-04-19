@@ -5,7 +5,11 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"os"
+	"os/signal"
 	"sync"
+	"sync/atomic"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -39,6 +43,8 @@ const (
 	ringSend    ringMessageType = "send"
 )
 
+const consumerCount = 2
+
 type ringMessage struct {
 	Type      ringMessageType `json:"type"`
 	ClientID  uint32          `json:"client"`
@@ -59,6 +65,11 @@ type Sum struct {
 	fruitItemMaps  map[inner.ClientID]map[string]fruititem.FruitItem
 	rowCounts      map[inner.ClientID]uint32
 	expectedTotals map[inner.ClientID]uint32
+
+	running      atomic.Bool
+	consumers    sync.WaitGroup
+	shutdownOnce sync.Once
+	done         chan struct{}
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -103,7 +114,7 @@ func NewSum(config SumConfig) (*Sum, error) {
 		return nil, err
 	}
 
-	return &Sum{
+	sum := &Sum{
 		id:             config.Id,
 		sumAmount:      config.SumAmount,
 		inputQueue:     inputQueue,
@@ -113,23 +124,79 @@ func NewSum(config SumConfig) (*Sum, error) {
 		fruitItemMaps:  map[inner.ClientID]map[string]fruititem.FruitItem{},
 		rowCounts:      map[inner.ClientID]uint32{},
 		expectedTotals: map[inner.ClientID]uint32{},
-	}, nil
+		done:           make(chan struct{}),
+	}
+	sum.running.Store(true)
+	return sum, nil
 }
 
-func (sum *Sum) Run() {
-	go func() {
-		if err := sum.ringIn.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-			sum.handleRingMessage(msg, ack, nack)
-		}); err != nil {
-			slog.Error("Ring consumer stopped", "err", err)
-		}
-	}()
+func (sum *Sum) Run() error {
+	go sum.handleSignals()
 
-	if err := sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+	sum.consumers.Add(consumerCount)
+	go sum.runConsumer(sum.ringIn, "ring", func(msg middleware.Message, ack, nack func()) {
+		sum.handleRingMessage(msg, ack, nack)
+	})
+	go sum.runConsumer(sum.inputQueue, "input", func(msg middleware.Message, ack, nack func()) {
 		sum.handleInputMessage(msg, ack, nack)
-	}); err != nil {
-		slog.Error("Input queue consumer stopped", "err", err)
+	})
+
+	sum.consumers.Wait()
+	return sum.closeAll()
+}
+
+func (sum *Sum) runConsumer(queue middleware.Middleware, name string, cb func(middleware.Message, func(), func())) {
+	defer sum.consumers.Done()
+	err := queue.StartConsuming(cb)
+	if err != nil && sum.running.Load() {
+		slog.Error("Consumer stopped unexpectedly", "name", name, "err", err)
+		sum.shutdown()
 	}
+}
+
+func (sum *Sum) handleSignals() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	select {
+	case <-signals:
+		sum.shutdown()
+	case <-sum.done:
+		// Acá se manejaría el caso de una falla inesperada de consumer que dispare el shutdown desde otro lado que no sea la señal.
+		// El TP asume que ningún nodo se cae, así que en el camino normal el shutdown siempre lo dispara SIGTERM.	
+	}
+}
+
+func (sum *Sum) shutdown() {
+	sum.shutdownOnce.Do(func() {
+		slog.Info("SIGTERM received, shutting down")
+		sum.running.Store(false)
+		if err := sum.inputQueue.StopConsuming(); err != nil {
+			slog.Debug("While stopping input consumer", "err", err)
+		}
+		if err := sum.ringIn.StopConsuming(); err != nil {
+			slog.Debug("While stopping ring consumer", "err", err)
+		}
+		close(sum.done)
+	})
+}
+
+func (sum *Sum) closeAll() error {
+	if err := sum.inputQueue.Close(); err != nil {
+		slog.Debug("While closing input queue", "err", err)
+	}
+	if err := sum.ringIn.Close(); err != nil {
+		slog.Debug("While closing ring in", "err", err)
+	}
+	if err := sum.ringOut.Close(); err != nil {
+		slog.Debug("While closing ring out", "err", err)
+	}
+	for i, q := range sum.outputQueues {
+		if err := q.Close(); err != nil {
+			slog.Debug("While closing output shard", "index", i, "err", err)
+		}
+	}
+	return nil
 }
 
 func (sum *Sum) handleInputMessage(msg middleware.Message, ack func(), nack func()) {
