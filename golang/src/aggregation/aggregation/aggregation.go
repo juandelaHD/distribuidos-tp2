@@ -24,7 +24,7 @@ type AggregationConfig struct {
 
 type Aggregation struct {
 	outputQueue   middleware.Middleware
-	inputExchange middleware.Middleware
+	inputQueue    middleware.Middleware
 	fruitItemMaps map[inner.ClientID]map[string]fruititem.FruitItem
 	topSize       int
 	sumAmount     int
@@ -39,8 +39,8 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 		return nil, err
 	}
 
-	inputExchangeRoutingKey := []string{fmt.Sprintf("%s_%d", config.AggregationPrefix, config.Id)}
-	inputExchange, err := middleware.CreateExchangeMiddleware(config.AggregationPrefix, inputExchangeRoutingKey, connSettings)
+	inputQueueName := fmt.Sprintf("%s_%d", config.AggregationPrefix, config.Id)
+	inputQueue, err := middleware.CreateQueueMiddleware(inputQueueName, connSettings)
 	if err != nil {
 		outputQueue.Close()
 		return nil, err
@@ -48,7 +48,7 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 
 	return &Aggregation{
 		outputQueue:   outputQueue,
-		inputExchange: inputExchange,
+		inputQueue:    inputQueue,
 		fruitItemMaps: map[inner.ClientID]map[string]fruititem.FruitItem{},
 		topSize:       config.TopSize,
 		sumAmount:     config.SumAmount,
@@ -57,7 +57,7 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 }
 
 func (aggregation *Aggregation) Run() {
-	aggregation.inputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+	aggregation.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		aggregation.handleMessage(msg, ack, nack)
 	})
 }

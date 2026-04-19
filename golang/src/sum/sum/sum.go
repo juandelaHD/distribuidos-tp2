@@ -3,6 +3,7 @@ package sum
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"sync"
 
@@ -10,6 +11,15 @@ import (
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/middleware"
 )
+
+// shardIndex mapea una fruta a un índice de aggregator usando FNV-1a 32-bit.
+// Todos los Sums corren el mismo binario, así que siempre dan el mismo resultado
+// para el mismo input. Eso garantiza que cada fruta viva en un único shard.
+func shardIndex(fruit string, shards int) int {
+	h := fnv.New32a()
+	h.Write([]byte(fruit))
+	return int(h.Sum32() % uint32(shards))
+}
 
 type SumConfig struct {
 	Id                int
@@ -38,12 +48,12 @@ type ringMessage struct {
 }
 
 type Sum struct {
-	id             int
-	sumAmount      int
-	inputQueue     middleware.Middleware
-	outputExchange middleware.Middleware
-	ringIn         middleware.Middleware
-	ringOut        middleware.Middleware
+	id           int
+	sumAmount    int
+	inputQueue   middleware.Middleware
+	outputQueues []middleware.Middleware
+	ringIn       middleware.Middleware
+	ringOut      middleware.Middleware
 
 	mu             sync.Mutex
 	fruitItemMaps  map[inner.ClientID]map[string]fruititem.FruitItem
@@ -59,22 +69,28 @@ func NewSum(config SumConfig) (*Sum, error) {
 		return nil, err
 	}
 
-	outputExchangeRouteKeys := make([]string, config.AggregationAmount)
-	for i := range config.AggregationAmount {
-		outputExchangeRouteKeys[i] = fmt.Sprintf("%s_%d", config.AggregationPrefix, i)
+	outputQueues := make([]middleware.Middleware, 0, config.AggregationAmount)
+	closeOutputs := func() {
+		for _, q := range outputQueues {
+			q.Close()
+		}
 	}
-
-	outputExchange, err := middleware.CreateExchangeMiddleware(config.AggregationPrefix, outputExchangeRouteKeys, connSettings)
-	if err != nil {
-		inputQueue.Close()
-		return nil, err
+	for i := range config.AggregationAmount {
+		queueName := fmt.Sprintf("%s_%d", config.AggregationPrefix, i)
+		q, err := middleware.CreateQueueMiddleware(queueName, connSettings)
+		if err != nil {
+			inputQueue.Close()
+			closeOutputs()
+			return nil, err
+		}
+		outputQueues = append(outputQueues, q)
 	}
 
 	ringInName := fmt.Sprintf("%s_ring_%d", config.SumPrefix, config.Id)
 	ringIn, err := middleware.CreateQueueMiddleware(ringInName, connSettings)
 	if err != nil {
 		inputQueue.Close()
-		outputExchange.Close()
+		closeOutputs()
 		return nil, err
 	}
 
@@ -82,7 +98,7 @@ func NewSum(config SumConfig) (*Sum, error) {
 	ringOut, err := middleware.CreateQueueMiddleware(ringOutName, connSettings)
 	if err != nil {
 		inputQueue.Close()
-		outputExchange.Close()
+		closeOutputs()
 		ringIn.Close()
 		return nil, err
 	}
@@ -91,7 +107,7 @@ func NewSum(config SumConfig) (*Sum, error) {
 		id:             config.Id,
 		sumAmount:      config.SumAmount,
 		inputQueue:     inputQueue,
-		outputExchange: outputExchange,
+		outputQueues:   outputQueues,
 		ringIn:         ringIn,
 		ringOut:        ringOut,
 		fruitItemMaps:  map[inner.ClientID]map[string]fruititem.FruitItem{},
@@ -252,6 +268,7 @@ func (sum *Sum) flushClientData(clientID inner.ClientID) {
 
 	slog.Info("Flushing accumulated data to aggregation", "client", clientID, "fruits", len(clientMap))
 
+	shardCount := len(sum.outputQueues)
 	for key := range clientMap {
 		fruitRecord := []fruititem.FruitItem{clientMap[key]}
 		message, err := inner.SerializeMessage(clientID, fruitRecord)
@@ -259,7 +276,8 @@ func (sum *Sum) flushClientData(clientID inner.ClientID) {
 			slog.Debug("While serializing message", "err", err)
 			return
 		}
-		if err := sum.outputExchange.Send(*message); err != nil {
+		shard := shardIndex(clientMap[key].Fruit, shardCount)
+		if err := sum.outputQueues[shard].Send(*message); err != nil {
 			slog.Debug("While sending message", "err", err)
 			return
 		}
@@ -270,8 +288,11 @@ func (sum *Sum) flushClientData(clientID inner.ClientID) {
 		slog.Debug("While serializing EOF message", "err", err)
 		return
 	}
-	if err := sum.outputExchange.Send(*eofMessage); err != nil {
-		slog.Debug("While sending EOF message", "err", err)
+	for _, q := range sum.outputQueues {
+		if err := q.Send(*eofMessage); err != nil {
+			slog.Debug("While sending EOF message", "err", err)
+			return
+		}
 	}
 }
 
