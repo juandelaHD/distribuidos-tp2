@@ -50,7 +50,7 @@ func (join *Join) Run() {
 func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	defer ack()
 
-	clientID, _, isEof, err := inner.DeserializeMessage(&msg)
+	clientID, _, isEof, _, err := inner.DeserializeMessage(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
 		return

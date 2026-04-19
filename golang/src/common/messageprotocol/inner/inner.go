@@ -17,6 +17,7 @@ type wireFruitItem struct {
 type wireMessage struct {
 	ClientID ClientID        `json:"c"`
 	Data     []wireFruitItem `json:"d"`
+	Total    uint32          `json:"t,omitempty"`
 }
 
 func SerializeMessage(clientID ClientID, fruitRecords []fruititem.FruitItem) (*middleware.Message, error) {
@@ -39,10 +40,18 @@ func SerializeEOFMessage(clientID ClientID) (*middleware.Message, error) {
 	return SerializeMessage(clientID, nil)
 }
 
-func DeserializeMessage(message *middleware.Message) (ClientID, []fruititem.FruitItem, bool, error) {
+func SerializeEOFMessageWithTotal(clientID ClientID, total uint32) (*middleware.Message, error) {
+	body, err := json.Marshal(wireMessage{ClientID: clientID, Data: []wireFruitItem{}, Total: total})
+	if err != nil {
+		return nil, err
+	}
+	return &middleware.Message{Body: string(body)}, nil
+}
+
+func DeserializeMessage(message *middleware.Message) (ClientID, []fruititem.FruitItem, bool, uint32, error) {
 	var wire wireMessage
 	if err := json.Unmarshal([]byte(message.Body), &wire); err != nil {
-		return 0, nil, false, err
+		return 0, nil, false, 0, err
 	}
 
 	fruitRecords := make([]fruititem.FruitItem, 0, len(wire.Data))
@@ -53,5 +62,5 @@ func DeserializeMessage(message *middleware.Message) (ClientID, []fruititem.Frui
 		})
 	}
 
-	return wire.ClientID, fruitRecords, len(fruitRecords) == 0, nil
+	return wire.ClientID, fruitRecords, len(fruitRecords) == 0, wire.Total, nil
 }

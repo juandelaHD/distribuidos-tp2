@@ -12,6 +12,7 @@ var nextClientID uint32
 
 type MessageHandler struct {
 	clientID inner.ClientID
+	rowCount uint32
 }
 
 func NewMessageHandler() MessageHandler {
@@ -20,15 +21,16 @@ func NewMessageHandler() MessageHandler {
 }
 
 func (messageHandler *MessageHandler) SerializeDataMessage(fruitRecord fruititem.FruitItem) (*middleware.Message, error) {
+	messageHandler.rowCount++
 	return inner.SerializeMessage(messageHandler.clientID, []fruititem.FruitItem{fruitRecord})
 }
 
 func (messageHandler *MessageHandler) SerializeEOFMessage() (*middleware.Message, error) {
-	return inner.SerializeEOFMessage(messageHandler.clientID)
+	return inner.SerializeEOFMessageWithTotal(messageHandler.clientID, messageHandler.rowCount)
 }
 
 func (messageHandler *MessageHandler) DeserializeResultMessage(message *middleware.Message) ([]fruititem.FruitItem, error) {
-	clientID, fruitRecords, _, err := inner.DeserializeMessage(message)
+	clientID, fruitRecords, _, _, err := inner.DeserializeMessage(message)
 	if err != nil {
 		return nil, err
 	}

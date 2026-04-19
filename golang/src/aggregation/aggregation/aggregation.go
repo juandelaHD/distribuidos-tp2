@@ -27,6 +27,8 @@ type Aggregation struct {
 	inputExchange middleware.Middleware
 	fruitItemMaps map[inner.ClientID]map[string]fruititem.FruitItem
 	topSize       int
+	sumAmount     int
+	eofCounts     map[inner.ClientID]int
 }
 
 func NewAggregation(config AggregationConfig) (*Aggregation, error) {
@@ -49,6 +51,8 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 		inputExchange: inputExchange,
 		fruitItemMaps: map[inner.ClientID]map[string]fruititem.FruitItem{},
 		topSize:       config.TopSize,
+		sumAmount:     config.SumAmount,
+		eofCounts:     map[inner.ClientID]int{},
 	}, nil
 }
 
@@ -61,7 +65,7 @@ func (aggregation *Aggregation) Run() {
 func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	defer ack()
 
-	clientID, fruitRecords, isEof, err := inner.DeserializeMessage(&msg)
+	clientID, fruitRecords, isEof, _, err := inner.DeserializeMessage(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
 		return
@@ -78,7 +82,15 @@ func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func()
 }
 
 func (aggregation *Aggregation) handleEndOfRecordsMessage(clientID inner.ClientID) error {
-	slog.Info("Received End Of Records message", "client", clientID)
+	aggregation.eofCounts[clientID]++
+	slog.Debug("Received End Of Records message", "client", clientID, "count", aggregation.eofCounts[clientID], "expected", aggregation.sumAmount)
+
+	if aggregation.eofCounts[clientID] < aggregation.sumAmount {
+		return nil
+	}
+	delete(aggregation.eofCounts, clientID)
+
+	slog.Info("All partials received, sending top to join", "client", clientID, "top_size", aggregation.topSize)
 
 	fruitTopRecords := aggregation.buildFruitTop(clientID)
 	message, err := inner.SerializeMessage(clientID, fruitTopRecords)
