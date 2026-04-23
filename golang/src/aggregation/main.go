@@ -68,23 +68,23 @@ func loadConfig() (aggregation.AggregationConfig, error) {
 	}, nil
 }
 
-func run() int {
+func run() error {
 	config, err := loadConfig()
 	if err != nil {
-		slog.Error("While loading config", "err", err)
-		return 1
+		return err
 	}
 
 	server, err := aggregation.NewAggregation(config)
 	if err != nil {
-		slog.Error("While initializing aggregation", "err", err)
-		return 1
+		return err
 	}
 
-	server.Run()
-	return 0
+	return server.Run()
 }
 
 func main() {
-	os.Exit(run())
+	if err := run(); err != nil {
+		slog.Error("Fatal error", "err", err)
+		os.Exit(1)
+	}
 }
